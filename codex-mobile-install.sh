@@ -7,12 +7,19 @@ set -e
 C1=$'\e[38;2;122;162;247m'; C2=$'\e[38;2;158;206;106m'; C3=$'\e[38;2;224;175;104m'; R=$'\e[0m'
 say() { echo -e "${C1}◆${R} $*"; }
 
+if ! command -v pkg >/dev/null 2>&1; then
+    echo "Este instalador requiere Termux (comando pkg no disponible)." >&2
+    exit 69
+fi
+
 say "Instalando dependencias (python, git, tmux, termux-api)…"
-pkg update -y >/dev/null 2>&1 || true
-pkg install -y python git tmux termux-api >/dev/null 2>&1 || pkg install -y python git
+pkg install -y python git >/dev/null 2>&1
+pkg install -y tmux termux-api >/dev/null 2>&1 || true
 
 say "Instalando librerías de interfaz (rich, prompt_toolkit)…"
-pip install --quiet --upgrade rich prompt_toolkit
+if ! python -c 'import rich, prompt_toolkit' >/dev/null 2>&1; then
+    python -m pip install --quiet rich prompt_toolkit
+fi
 
 if [ ! -d "$HOME/storage/shared" ]; then
   say "Pidiendo acceso al almacenamiento interno (acepta el permiso)…"
@@ -30,7 +37,7 @@ CODEX MOBILE  ·  agente de código multi-modelo para Termux
 - Arquitecto (planifica y ordena) + Obrero (ejecuta) + Rápido (consultas fáciles)
 - Sesiones independientes en almacenamiento interno, cada una con su configuración
 """
-import os, sys, re, json, time, shutil, signal, subprocess, unicodedata
+import os, sys, re, json, time, shutil, signal, subprocess, unicodedata, socket, uuid
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -193,8 +200,14 @@ def storage_root():
 def http_json(url, headers, payload=None, timeout=300, method="POST"):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read(500).decode("utf-8", "replace")
+        raise APIError(f"HTTP {e.code}: {detail or e.reason}", e.code)
+    except (TimeoutError, urllib.error.URLError, OSError) as e:
+        raise APIError(f"error de red: {e}", -1)
 
 
 # ───────────────────────── Configuración global ─────────────────────────
@@ -644,7 +657,7 @@ def rp(ctx, p):
 
 def inside(ctx, p):
     try:
-        Path(os.path.abspath(p)).relative_to(os.path.abspath(ctx.ws))
+        Path(p).resolve().relative_to(Path(ctx.ws).resolve())
         return True
     except ValueError:
         return False
@@ -666,6 +679,8 @@ def is_safe_cmd(cmd):
         toks = seg.strip().split()
         if not toks:
             continue
+        if any("/" in t or t.startswith("~") or "$" in t or re.search(r"(^|/)\.\.(/|$)", t) for t in toks[1:]):
+            return False
         if toks[0] not in SAFE_CMDS:
             return False
         if toks[0] == "git" and (len(toks) < 2 or toks[1] not in SAFE_GIT):
@@ -694,9 +709,105 @@ def approve(ctx, title, detail, danger=False):
 
 
 def guard_outside(ctx, p, verb):
-    if not inside(ctx, p):
-        if not approve(ctx, "Fuera del workspace", f"{verb}: {p}"):
+    resolved = Path(p).resolve()
+    if not inside(ctx, resolved):
+        if not approve(ctx, "Fuera del workspace", f"{verb}: {resolved}"):
             raise ToolError("el usuario denegó la operación fuera del workspace")
+
+
+def snapshot_file(ctx, p):
+    p = Path(p).resolve()
+    if not inside(ctx, p):
+        return
+    if p.exists() and not p.is_file():
+        return
+    meta = ctx.ws / ".codex" / "snapshots.json"
+    folder = ctx.ws / ".codex" / "snapshots"
+    folder.mkdir(parents=True, exist_ok=True)
+    entries = json.loads(meta.read_text()) if meta.exists() else []
+    backup = None
+    if p.is_file():
+        backup = uuid.uuid4().hex + ".bak"
+        shutil.copy2(p, folder / backup)
+    entries.append({"path": str(p.relative_to(ctx.ws.resolve())), "backup": backup,
+                    "created": datetime.now().isoformat(timespec="seconds")})
+    for old in entries[:-50]:
+        if old.get("backup"):
+            (folder / old["backup"]).unlink(missing_ok=True)
+    meta.write_text(json.dumps(entries[-50:], ensure_ascii=False, indent=1))
+
+
+def cmd_rollback(ctx, arg):
+    meta = ctx.ws / ".codex" / "snapshots.json"
+    if not meta.is_file():
+        console.print(Text("  no hay snapshots para restaurar", style="muted"))
+        return
+    try:
+        count = min(max(int(arg or "1"), 1), 20)
+        entries = json.loads(meta.read_text())
+        restored = 0
+        folder = meta.parent / "snapshots"
+        for _ in range(count):
+            if not entries:
+                break
+            item = entries.pop()
+            target = (ctx.ws / item["path"]).resolve()
+            if not inside(ctx, target):
+                continue
+            backup = item.get("backup")
+            if backup:
+                source = folder / backup
+                if source.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                    source.unlink()
+            else:
+                target.unlink(missing_ok=True)
+            restored += 1
+        meta.write_text(json.dumps(entries, ensure_ascii=False, indent=1))
+        console.print(Text(f"  ✓ rollback aplicado ({restored} cambio(s))", style="ok"))
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        console.print(Text(f"  no se pudo aplicar rollback: {e}", style="err"))
+
+
+def start_preview(ctx):
+    found = False
+    for root, dirs, files in os.walk(ctx.ws):
+        dirs[:] = [d for d in dirs if d not in IGN]
+        if any(name.lower().endswith(".html") for name in files):
+            found = True
+            break
+    if not found:
+        return
+    meta = ctx.ws / ".codex"
+    meta.mkdir(parents=True, exist_ok=True)
+    pid_file, url_file = meta / "http.pid", meta / "http.url"
+    try:
+        pid = int(pid_file.read_text()) if pid_file.exists() else 0
+        if pid:
+            os.kill(pid, 0)
+            if url_file.exists():
+                console.print(Text(f"  preview local: {url_file.read_text().strip()}", style="ok"))
+                return
+    except (ValueError, OSError):
+        pass
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    log = (meta / "http.log").open("ab")
+    try:
+        proc = subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+                                cwd=str(ctx.ws), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                start_new_session=True)
+    except OSError as e:
+        log.close()
+        console.print(Text(f"  no se pudo iniciar preview: {e}", style="warn"))
+        return
+    log.close()
+    url = f"http://127.0.0.1:{port}/"
+    pid_file.write_text(str(proc.pid))
+    url_file.write_text(url)
+    console.print(Text(f"  preview local: {url}", style="ok"))
 
 
 IGN = {".git", "node_modules", "__pycache__", ".codex", ".venv", "venv", ".cache"}
@@ -713,6 +824,9 @@ def walk_tree(base, depth=2, limit=300):
             return
         for p in ents:
             if p.name in IGN:
+                continue
+            if p.is_symlink():
+                lines.append("  " * lvl + p.name + " -> (symlink omitido)")
                 continue
             if len(lines) >= limit:
                 lines.append("  " * lvl + "…")
@@ -734,6 +848,7 @@ def walk_tree(base, depth=2, limit=300):
 
 def t_list_dir(ctx, a):
     base = rp(ctx, a.get("path", "."))
+    guard_outside(ctx, base, "listar")
     if not base.is_dir():
         raise ToolError(f"no es una carpeta: {base}")
     lines = walk_tree(base, int(a.get("depth", "2") or 2))
@@ -742,6 +857,7 @@ def t_list_dir(ctx, a):
 
 def t_read_file(ctx, a):
     p = rp(ctx, a["path"])
+    guard_outside(ctx, p, "leer")
     if not p.is_file():
         raise ToolError(f"no existe el archivo: {p}")
     raw = p.read_bytes()
@@ -762,6 +878,7 @@ def t_write_file(ctx, a):
     p = rp(ctx, a["path"])
     content = a.get("content", "")
     guard_outside(ctx, p, "escribir")
+    snapshot_file(ctx, p)
     p.parent.mkdir(parents=True, exist_ok=True)
     existed = p.exists()
     p.write_text(content, encoding="utf-8")
@@ -778,6 +895,7 @@ def t_edit_file(ctx, a):
     if not p.is_file():
         raise ToolError(f"no existe el archivo: {p}")
     guard_outside(ctx, p, "editar")
+    snapshot_file(ctx, p)
     old, new = a["old"], a.get("new", "")
     txt = p.read_text(encoding="utf-8", errors="replace")
     n = txt.count(old)
@@ -821,6 +939,7 @@ def t_delete(ctx, a):
 
 def t_search(ctx, a):
     base = rp(ctx, a.get("path", "."))
+    guard_outside(ctx, base, "buscar")
     try:
         rx = re.compile(a["pattern"])
     except re.error as e:
@@ -836,6 +955,8 @@ def t_search(ctx, a):
                     files.append(Path(root) / f)
     for f in files:
         try:
+            if f.is_symlink():
+                continue
             if f.stat().st_size > 1_000_000:
                 continue
             raw = f.read_bytes()
@@ -878,18 +999,18 @@ def run_shell(ctx, cmd, timeout=120):
     env.update({"PAGER": "cat", "GIT_PAGER": "cat", "CI": "1", "DEBIAN_FRONTEND": "noninteractive"})
     Path(ctx.ws).mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen(cmd, shell=True, executable=exe, cwd=str(ctx.ws), stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                         stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env,
                          start_new_session=True)
     try:
         with console.status(Text.assemble(("ejecutando ", "bold work"), (cmd[:50], "muted")), spinner="dots"):
-            out, _ = p.communicate(timeout=timeout)
+            out, err = p.communicate(timeout=timeout)
         code = p.returncode
     except subprocess.TimeoutExpired:
         try:
             os.killpg(p.pid, signal.SIGKILL)
         except Exception:
             pass
-        out, _ = p.communicate()
+        out, err = p.communicate()
         code = f"timeout>{timeout}s"
     except KeyboardInterrupt:
         try:
@@ -897,7 +1018,13 @@ def run_shell(ctx, cmd, timeout=120):
         except Exception:
             pass
         raise
-    return code, clip(out.decode("utf-8", "replace").rstrip())
+    stdout = out.decode("utf-8", "replace").rstrip()
+    stderr = err.decode("utf-8", "replace").rstrip()
+    if code != 0 and stderr:
+        stdout = (stdout + "\n[stderr]\n" + stderr).strip()
+    elif stderr:
+        stdout = (stdout + "\n[stderr]\n" + stderr).strip()
+    return code, clip(stdout)
 
 
 def t_run(ctx, a):
@@ -1064,6 +1191,21 @@ def classify(msg):
     return "exec" if words > 40 else "fast"
 
 
+def smart_route(ctx, msg):
+    key = ctx.cfg.get("keys", {}).get("groq")
+    if not key:
+        return classify(msg)
+    ref = "groq:openai/gpt-oss-20b"
+    system = ("Clasifica la petición en una ruta. Responde únicamente fast, exec o full. "
+              "fast=consulta; exec=cambio acotado; full=proyecto, varios archivos o arquitectura.")
+    try:
+        text, _ = chat(ctx.cfg, ref, system, [{"role": "user", "content": msg}], timeout=30)
+        route = clean_text(text).strip().lower().split()[0]
+        return route if route in ("fast", "exec", "full") else classify(msg)
+    except (APIError, TimeoutError, OSError, IndexError):
+        return classify(msg)
+
+
 ROUTE_LABEL = {"fast": ("rápido", "fast"), "exec": ("directo · obrero", "work"),
                "full": ("arquitecto → obrero → revisión", "plan")}
 
@@ -1130,8 +1272,14 @@ def remember(ctx, msg, final):
 def turn(ctx, msg):
     t0 = time.time()
     ctx.actions = []
-    route = ctx.sess.get("route", "auto")
-    if route == "auto":
+    router = ctx.sess.get("router_mode", "auto")
+    if router == "smart":
+        route = smart_route(ctx, msg)
+    elif router == "manual":
+        route = ctx.sess.get("route", "exec")
+        if route == "auto":
+            route = "exec"
+    else:
         route = classify(msg)
     lab, st = ROUTE_LABEL[route]
     console.print(Rule(Text(f" {lab} ", style=f"bold {st}"), style="muted", characters="─"))
@@ -1150,6 +1298,7 @@ def turn(ctx, msg):
         if route == "full" and ctx.sess.get("review", True):
             phase_review(ctx, msg, plan, final)
         remember(ctx, msg, final)
+        start_preview(ctx)
     except APIError as e:
         console.print(Panel(Text(str(e)), title=" Error de API ", border_style="err", box=ROUNDED))
         return
@@ -1177,7 +1326,8 @@ COMMANDS = {
     "/modelos": "ver y elegir modelos (u = actualizar lista)", "/claves": "gestionar API keys",
     "/agregar": "añadir otro proveedor gratis (URL + key)",
     "/modo": "normal | total",
-    "/ruta": "auto | rapido | directo | plan", "/revision": "on | off (revisión del arquitecto)",
+    "/ruta": "rapido | directo | plan (selección manual)", "/router": "auto | manual | smart (Groq GPT-OSS-20B)",
+    "/revision": "on | off (revisión del arquitecto)", "/rollback": "restaurar cambios recientes",
     "/plan": "mostrar el plan actual", "/ver": "árbol de archivos", "/costo": "tokens usados",
     "/limpiar": "borrar memoria de la sesión", "/copiar": "copiar última respuesta",
     "/config": "ver configuración de la sesión", "/salir": "salir de Codex Mobile",
@@ -1416,7 +1566,7 @@ def startup_keys(cfg):
 def new_sess_dict(name):
     return {"name": name, "created": datetime.now().isoformat(timespec="seconds"),
             "models": {"plan": "auto", "code": "auto", "fast": "auto"}, "mode": "normal",
-            "route": "auto", "review": True, "history": [], "tokens": [0, 0]}
+            "route": "auto", "router_mode": "auto", "review": True, "history": [], "tokens": [0, 0]}
 
 
 def load_sess(ws):
@@ -1644,6 +1794,7 @@ def cmd_config(ctx):
     t.add_row("carpeta", str(ctx.ws))
     t.add_row("modo", s["mode"])
     t.add_row("ruta", s["route"])
+    t.add_row("router", s.get("router_mode", "auto"))
     t.add_row("revisión", "on" if s["review"] else "off")
     for r in ("plan", "code", "fast"):
         t.add_row(ROLE_NAME[r].lower(), s["models"][r])
@@ -1660,7 +1811,7 @@ def cmd_ayuda():
     t.add_row("!cmd", "ejecuta un comando de shell en el workspace")
     console.print(t)
     console.print(Text("  Rutas: rápido (consulta fácil) · directo (obrero) · plan (arquitecto → obrero → revisión)\n"
-                       "  Con 'auto' decide solo según la dificultad de tu mensaje.", style="muted"))
+                       "  Router: auto usa reglas locales, smart usa Groq si está configurado y manual respeta /ruta.", style="muted"))
 
 
 def command(ctx, line):
@@ -1699,10 +1850,24 @@ def command(ctx, line):
         m = {"auto": "auto", "rapido": "fast", "rápido": "fast", "directo": "exec", "plan": "full", "full": "full"}
         if arg.lower() in m:
             ctx.sess["route"] = m[arg.lower()]
+            ctx.sess["router_mode"] = "auto" if m[arg.lower()] == "auto" else "manual"
             ctx.save()
-            console.print(Text(f"  ruta → {arg.lower()}", style="ok"))
+            console.print(Text(f"  ruta → {arg.lower()} · router {ctx.sess['router_mode']}", style="ok"))
         else:
             console.print(Text("  uso: /ruta auto | rapido | directo | plan", style="err"))
+    elif cmd == "/router":
+        mode = arg.lower()
+        if mode in ("auto", "manual", "smart"):
+            ctx.sess["router_mode"] = mode
+            if mode == "manual" and ctx.sess.get("route") == "auto":
+                ctx.sess["route"] = "exec"
+            ctx.save()
+            console.print(Text(f"  router → {mode}" + (" (Groq GPT-OSS-20B; fallback local)" if mode == "smart" else ""),
+                               style="ok"))
+        else:
+            console.print(Text("  uso: /router auto | manual | smart", style="err"))
+    elif cmd == "/rollback":
+        cmd_rollback(ctx, arg)
     elif cmd == "/revision":
         ctx.sess["review"] = arg.lower() not in ("off", "no", "0")
         ctx.save()
@@ -1761,9 +1926,13 @@ def main():
             if not line:
                 continue
             if line.startswith("!"):
-                code, out = run_shell(CTX, line[1:].strip(), 300)
-                console.print(Text(out, style="muted"))
-                console.print(Text(f"  exit={code}", style="ok" if code == 0 else "err"))
+                try:
+                    result = t_run(CTX, {"command": line[1:].strip(), "timeout": "300"})
+                    head, _, out = result.partition("\n")
+                    console.print(Text(out, style="muted"))
+                    console.print(Text(f"  {head}", style="ok" if head == "exit=0" else "err"))
+                except ToolError as e:
+                    console.print(Text(f"  {e}", style="warn"))
             elif line.startswith("/"):
                 if command(CTX, line) == "exit":
                     break
@@ -1799,7 +1968,7 @@ APP="$HOME/.codex-mobile/codex_mobile.py"
 # Modo persistente: codex-mobile --tmux  → sobrevive aunque cierres Termux; vuelve a entrar con el mismo comando
 if [ "$1" = "--tmux" ]; then
   shift
-  exec tmux new-session -A -s codex "codex-mobile $*"
+    tmux new-session -A -s codex "codex-mobile $*"
 fi
 
 while true; do
